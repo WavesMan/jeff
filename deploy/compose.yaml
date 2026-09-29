@@ -1,0 +1,48 @@
+services:
+  jeff:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.jeff
+    environment:
+      JEFF_BACKEND: pytorch
+      JEFF_DEVICE: cuda
+      JEFF_CHECKPOINT: /models/selected
+      JEFF_API_KEY: ${JEFF_API_KEY}
+      JEFF_MAX_BATCH_SIZE: "4"
+      JEFF_MAX_BATCH_ROWS: "8"
+      JEFF_BATCH_WAIT_MS: "3"
+      JEFF_MAX_QUEUE: "32"
+      JEFF_HOST: 0.0.0.0
+      PORT: "8765"
+    volumes:
+      - ${JEFF_MODEL_DIR:?Set JEFF_MODEL_DIR to an immutable checkpoint directory}:/models/selected:ro
+    ports:
+      - "127.0.0.1:8765:8765"
+    gpus: all
+    shm_size: 2gb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  gateway:
+    build:
+      context: ../gateway/go
+      dockerfile: ../../deploy/Dockerfile.gateway
+    environment:
+      JEFF_URL: http://jeff:8765
+      JEFF_API_KEY: ${JEFF_API_KEY}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY}
+      MAX_QUEUE: "32"
+      BATCH_SIZE: "4"
+      BATCH_WAIT_MS: "3"
+      REQUEST_TIMEOUT_MS: "2000"
+      CACHE_ENTRIES: "256"
+    depends_on:
+      jeff:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
