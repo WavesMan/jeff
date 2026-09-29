@@ -1,0 +1,38 @@
+name: Docker Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: jeff
+            context: .
+            dockerfile: deploy/Dockerfile.jeff
+          - image: gateway
+            context: gateway/go
+            dockerfile: deploy/Dockerfile.gateway
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: jeff-local/${{ matrix.image }}:${{ github.ref_name }}
