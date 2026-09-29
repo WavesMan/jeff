@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hmac
@@ -43,6 +44,7 @@ class Service:
     checkpoint: str = "checkpoints/selected"
     release_date: str = ""
     lock: LockType = field(default_factory=threading.Lock)
+    batch_queue: BatchQueue | None = None
 
 
 service = Service()
@@ -108,6 +110,110 @@ class EvaluationRequest(BaseModel):
         return values
 
 
+class BatchEvaluationRequest(BaseModel):
+    """A bounded collection of ordinary System One requests."""
+
+    model_config = ConfigDict(extra="forbid")
+    model: str
+    requests: list[EvaluationRequest] = Field(min_length=1, max_length=4)
+
+    @field_validator("model")
+    @classmethod
+    def known_model(cls, value: str) -> str:
+        if value not in ALIASES | {service.name}:
+            raise ValueError(f"Unknown model. Use {service.name} or jeff-latest.")
+        return value
+
+
+@dataclass
+class PendingBatch:
+    body: BatchEvaluationRequest
+    future: asyncio.Future[dict[str, JSONValue]]
+    submitted_at: float
+
+
+class BatchQueue:
+    """Bounded, FIFO model queue for the batch API.
+
+    The gateway performs cross-HTTP-request aggregation.  This queue makes the
+    model-side API safe for direct callers too: it never exposes the legacy
+    endpoint's 529 busy-lock behaviour and it applies backpressure at 32 jobs.
+    """
+
+    def __init__(self, maximum: int, wait_ms: int) -> None:
+        self.queue: asyncio.Queue[PendingBatch] = asyncio.Queue(maxsize=maximum)
+        self.wait_seconds = wait_ms / 1000
+        self.worker: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self.worker = asyncio.create_task(self.run())
+
+    async def close(self) -> None:
+        if self.worker is not None:
+            self.worker.cancel()
+            try:
+                await self.worker
+            except asyncio.CancelledError:
+                pass
+
+    async def submit(self, body: BatchEvaluationRequest) -> dict[str, JSONValue]:
+        if self.worker is None:
+            raise RuntimeError("Batch queue is not running.")
+        future: asyncio.Future[dict[str, JSONValue]] = asyncio.get_running_loop().create_future()
+        try:
+            self.queue.put_nowait(PendingBatch(body, future, time.perf_counter()))
+        except asyncio.QueueFull as error:
+            raise HTTPException(429, "The batch queue is full. Retry shortly.", headers={"Retry-After": "1"}) from error
+        return await asyncio.shield(future)
+
+    async def run(self) -> None:
+        while True:
+            pending = await self.queue.get()
+            # A short delay lets independently arriving direct batch requests
+            # share the single model forward pass, while preserving FIFO order.
+            group = [pending]
+            deadline = time.perf_counter() + self.wait_seconds
+            while len(group) < int(os.getenv("JEFF_MAX_BATCH_SIZE", "4")):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    group.append(await asyncio.wait_for(self.queue.get(), remaining))
+                except TimeoutError:
+                    break
+            model = service.model
+            started = time.perf_counter()
+            try:
+                if model is None:
+                    raise RuntimeError("The model is not ready.")
+                bodies = [request for item in group for request in item.body.requests]
+                responses, input_tokens = await run_in_threadpool(predict_many, model, bodies)
+                inference_ms = (time.perf_counter() - started) * 1000
+                position = 0
+                for item in group:
+                    count = len(item.body.requests)
+                    answers = [response["answers"] for response in responses[position:position + count]]
+                    position += count
+                    item.future.set_result({
+                        "model": service.name,
+                        "answers": answers,
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": 0,
+                            "batch_size": len(bodies),
+                            "queue_wait_ms": round((started - item.submitted_at) * 1000, 3),
+                            "inference_ms": round(inference_ms, 3),
+                        },
+                    })
+            except Exception as error:
+                for item in group:
+                    if not item.future.done():
+                        item.future.set_exception(error)
+            finally:
+                for _ in group:
+                    self.queue.task_done()
+
+
 def authenticate(authorization: str | None = Header(default=None)) -> None:
     key = os.getenv("JEFF_API_KEY")
     if key and not hmac.compare_digest((authorization or "").encode(), f"Bearer {key}".encode()):
@@ -132,9 +238,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     service.name = f"jeff-{service.model.base_model.rsplit('/', 1)[-1].lower()}"
     modified = (Path(service.checkpoint) / "decision_config.json").stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
+    batch_queue = BatchQueue(int(os.getenv("JEFF_MAX_QUEUE", "32")), int(os.getenv("JEFF_BATCH_WAIT_MS", "3")))
+    batch_queue.start()
+    service.batch_queue = batch_queue
     try:
         yield
     finally:
+        await batch_queue.close()
+        service.batch_queue = None
         service.model = None
 
 
@@ -178,30 +289,49 @@ def models() -> dict[str, JSONValue]:
     ]}
 
 
-def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
+def predict_many(model: DecisionModel, bodies: list[EvaluationRequest]) -> tuple[list[DecisionResponse], int]:
+    """Run many HTTP requests through bounded model forwards and restore answers."""
     import torch
     from jeff.model import answer
 
-    questions = {key: cast(DecisionQuestion, question.model_dump(exclude_none=True))
-                 for key, question in body.questions.items()}
-    identifiers = list(questions)
-    rows: list[DecisionInput] = [{"state": body.state, "question": question, "images": list(body.images)}
-                                 for question in questions.values()]
-    answers: dict[str, Answer] = {}
+    questions_by_body: list[dict[str, DecisionQuestion]] = []
+    answers_by_body: list[dict[str, Answer]] = []
+    rows: list[tuple[int, str, DecisionInput]] = []
+    for body_index, body in enumerate(bodies):
+        questions = {key: cast(DecisionQuestion, question.model_dump(exclude_none=True))
+                     for key, question in body.questions.items()}
+        questions_by_body.append(questions)
+        answers_by_body.append({})
+        rows.extend((body_index, identifier, {"state": body.state, "question": question, "images": list(body.images)})
+                    for identifier, question in questions.items())
     input_tokens = 0
     if getattr(model, "backend", None) == "mlx":
-        for identifier, (values, tokens) in zip(identifiers, model.decide(rows), strict=True):  # type: ignore[attr-defined]
-            answers[identifier] = answer(questions[identifier], values)
+        inputs = [row for _, _, row in rows]
+        for (body_index, identifier, _), (values, tokens) in zip(rows, model.decide(inputs), strict=True):  # type: ignore[attr-defined]
+            answers_by_body[body_index][identifier] = answer(questions_by_body[body_index][identifier], values)
             input_tokens += tokens
-        return {"model": service.name, "answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
+        return ([{"model": service.name, "answers": answers, "usage": {"input_tokens": 0, "output_tokens": 0}}
+                 for answers in answers_by_body], input_tokens)
+    max_rows = int(os.getenv("JEFF_MAX_BATCH_ROWS", "8"))
+    if max_rows < 1:
+        raise ValueError("JEFF_MAX_BATCH_ROWS must be positive.")
     with torch.inference_mode():
-        for start in range(0, len(rows), 8):
-            batch = model.prepare(rows[start:start + 8])
+        for start in range(0, len(rows), max_rows):
+            chunk = rows[start:start + max_rows]
+            batch = model.prepare([row for _, _, row in chunk])
             distributions: list[list[float]] = (model(batch) / model.temperature).softmax(-1).cpu().tolist()
-            for identifier, values, count in zip(identifiers[start:start + 8], distributions, batch.counts, strict=True):
-                answers[identifier] = answer(questions[identifier], values[:count])
+            for (body_index, identifier, _), values, count in zip(chunk, distributions, batch.counts, strict=True):
+                answers_by_body[body_index][identifier] = answer(questions_by_body[body_index][identifier], values[:count])
             input_tokens += batch.input_tokens
-    return {"model": service.name, "answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
+    return ([{"model": service.name, "answers": answers, "usage": {"input_tokens": 0, "output_tokens": 0}}
+             for answers in answers_by_body], input_tokens)
+
+
+def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
+    responses, input_tokens = predict_many(model, [body])
+    response = responses[0]
+    response["usage"] = {"input_tokens": input_tokens, "output_tokens": 0}
+    return response
 
 
 @app.post("/v1/systemone", dependencies=[Depends(authenticate)], response_model=None)
@@ -217,6 +347,20 @@ async def system_one(body: EvaluationRequest) -> DecisionResponse:
         raise HTTPException(422, str(error)) from error
     finally:
         service.lock.release()
+
+
+@app.post("/v1/systemone:batch", dependencies=[Depends(authenticate)], response_model=None)
+async def system_one_batch(body: BatchEvaluationRequest) -> dict[str, JSONValue]:
+    """Queue a bounded batch without exposing the legacy endpoint's busy lock."""
+    batch_queue = getattr(service, "batch_queue", None)
+    if service.model is None or batch_queue is None:
+        raise HTTPException(503, "The model is not ready.")
+    try:
+        return await batch_queue.submit(body)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(503, str(error)) from error
 
 
 def main() -> None:
