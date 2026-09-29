@@ -6,22 +6,12 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.image }}
+  build-and-release:
+    name: Build and publish release assets
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: jeff
-            context: .
-            dockerfile: deploy/Dockerfile.jeff
-          - image: gateway
-            context: gateway/go
-            dockerfile: deploy/Dockerfile.gateway
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -29,10 +19,50 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
+      - name: Build Jeff image
         uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: deploy/Dockerfile.jeff
+          load: true
           push: false
-          tags: jeff-local/${{ matrix.image }}:${{ github.ref_name }}
+          tags: jeff-local/jeff:${{ github.ref_name }}
+
+      - name: Build Gateway image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: gateway/go
+          file: deploy/Dockerfile.gateway
+          load: true
+          push: false
+          tags: jeff-local/gateway:${{ github.ref_name }}
+
+      - name: Package Docker images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          for image in jeff gateway; do
+            docker save "jeff-local/${image}:${GITHUB_REF_NAME}" \
+              | gzip -1 \
+              | split --bytes=1900m --numeric-suffixes=1 --suffix-length=3 - \
+                  "release-assets/${image}-${GITHUB_REF_NAME}.tar.gz.part-"
+          done
+          sha256sum release-assets/* > release-assets/SHA256SUMS
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi
