@@ -83,4 +83,5 @@ class DecisionResponse(TypedDict):
     model: NotRequired[str]
     id: NotRequired[str]
     provider: NotRequired[str]
-
+    cache_hit: NotRequired[bool]
+    model_called: NotRequired[bool]
