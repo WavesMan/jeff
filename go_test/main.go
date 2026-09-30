@@ -705,33 +705,36 @@ func printReport(report TestReport) {
 	printSection("测试报告")
 
 	fmt.Println()
-	printKV("并发级别", fmt.Sprintf("%d", report.ConcurrentLevel))
-	printKV("总请求数", fmt.Sprintf("%d", report.TotalRequests))
-	printKV("成功数", fmt.Sprintf("%d", report.SuccessCount))
-	printKV("失败数", fmt.Sprintf("%d", report.FailureCount))
-	printKV("成功率", fmt.Sprintf("%.2f%%", report.SuccessRate))
+	printKV("请求模式", report.RequestMode)
+	printKV("并发 / 请求数", fmt.Sprintf("%d / %d", report.ConcurrentLevel, report.TotalRequests))
+	printKV("重试后成功 / 失败", fmt.Sprintf("%d / %d", report.SuccessCount, report.FailureCount))
+	printKV("重试后成功率", fmt.Sprintf("%.2f%%", report.SuccessRate))
 	fmt.Println()
 	printKV("测试耗时", report.TestDuration.String())
 	printKV("平均延迟", report.AvgLatency.String())
-	printKV("最小延迟", report.MinLatency.String())
-	printKV("最大延迟", report.MaxLatency.String())
 	printKV("P95 延迟", report.P95Latency.String())
 	printKV("P99 延迟", report.P99Latency.String())
-	printKV("QPS (每秒请求数)", fmt.Sprintf("%.2f", report.RequestsPerSecond))
-	printKV("请求模式", report.RequestMode)
-	printKV("缓存命中/未命中/未知", fmt.Sprintf("%d / %d / %d", report.Cache.HitCount, report.Cache.MissCount, report.Cache.UnknownCount))
+	printKV("最小 / 最大延迟", fmt.Sprintf("%s / %s", report.MinLatency, report.MaxLatency))
+	printKV("逻辑请求吞吐", fmt.Sprintf("%.2f 请求/秒", report.RequestsPerSecond))
+	fmt.Println()
+	printKV("缓存 HIT / MISS / 未知", fmt.Sprintf("%d / %d / %d", report.Cache.HitCount, report.Cache.MissCount, report.Cache.UnknownCount))
 	if report.Cache.DetectedCount > 0 {
-		printKV("缓存命中率", fmt.Sprintf("%.2f%%（仅统计服务端明确标识）", report.Cache.HitRate))
-		printKV("命中平均延迟", report.Cache.HitAvgLatency)
-		printKV("未命中平均延迟", report.Cache.MissAvgLatency)
+		printKV("已识别请求命中率", fmt.Sprintf("%.2f%%（分母 %d，不含未知）", report.Cache.HitRate, report.Cache.DetectedCount))
+		if report.Cache.HitCount > 0 {
+			printKV("HIT 平均延迟", report.Cache.HitAvgLatency)
+		}
+		if report.Cache.MissCount > 0 {
+			printKV("MISS 平均延迟", report.Cache.MissAvgLatency)
+		}
 	} else {
 		printKV("缓存命中率", "未知（服务端未返回缓存标识）")
 	}
+	fmt.Println()
 	printKV("CPU 平均/峰值", fmt.Sprintf("%.1f%% / %.1f%% (%d 核)", report.Resources.AvgCPUPercent, report.Resources.PeakCPUPercent, report.Resources.CPUCores))
 	printKV("RAM 平均/峰值", fmt.Sprintf("%.1f%% / %.1f%%", report.Resources.AvgMemoryPercent, report.Resources.PeakMemoryPercent))
 	if report.Resources.GPUPresent {
-		printKV("GPU 平均/峰值", fmt.Sprintf("%.1f%% / %.1f%%", report.Resources.AvgGPUPercent, report.Resources.PeakGPUPercent))
-		printKV("显存平均/峰值", fmt.Sprintf("%.1f%% / %.1f%%", report.Resources.AvgGPUMemoryPercent, report.Resources.PeakGPUMemoryPercent))
+		printKV("GPU 利用率 平均/峰值", fmt.Sprintf("%.1f%% / %.1f%%（整机采样）", report.Resources.AvgGPUPercent, report.Resources.PeakGPUPercent))
+		printKV("显存占用 平均/峰值", fmt.Sprintf("%.1f%% / %.1f%%", report.Resources.AvgGPUMemoryPercent, report.Resources.PeakGPUMemoryPercent))
 		printKV("GPU 峰值温度", fmt.Sprintf("%.1f°C", report.Resources.PeakGPUTemperatureC))
 	} else {
 		printKV("GPU 监控", "N/A（未检测到 nvidia-smi/GPU）")
@@ -751,6 +754,7 @@ func findMaxConcurrency(targetURL string, mode string) TestReport {
 	var bestReport TestReport
 	var lastReport TestReport
 	var bestConcurrency int
+	var reports []TestReport
 
 	for _, conc := range concurrencyLevels {
 		requests := requestsPerLevel
@@ -758,7 +762,7 @@ func findMaxConcurrency(targetURL string, mode string) TestReport {
 			requests = conc
 		}
 		_, report := runConcurrentTest(targetURL, conc, requests, mode)
-		printReport(report)
+		reports = append(reports, report)
 		lastReport = report
 
 		// 大模型 API 允许少量瞬时限流/服务端失败：成功率 >= 85% 且平均延迟 < 5s。
@@ -766,13 +770,29 @@ func findMaxConcurrency(targetURL string, mode string) TestReport {
 		if isStable {
 			bestReport = report
 			bestConcurrency = conc
-			fmt.Printf("\n  [INFO] 并发 %d 稳定运行（本档 %d 个请求），继续测试更高级别...\n", conc, requests)
+			fmt.Printf("\n  [INFO] 并发 %d 达到阈值，继续测试下一档。\n", conc)
 		} else {
-			fmt.Printf("\n  [WARN] 并发 %d 出现不稳定 (成功率=%.1f%%, 平均延迟=%v)，停止递增\n",
+			fmt.Printf("\n  [WARN] 并发 %d 未达阈值 (重试后成功率=%.1f%%, 平均延迟=%v)，停止递增。\n",
 				conc, report.SuccessRate, report.AvgLatency)
 			break
 		}
 	}
+
+	printSection("并发档位汇总")
+	fmt.Printf("  %-10s %-10s %-18s %-13s %-12s %-10s %-10s\n", "并发", "请求数", "最终成功/失败", "成功率", "命中率*", "P95", "请求/秒")
+	fmt.Println("  " + strings.Repeat("-", 91))
+	for _, report := range reports {
+		hitRate := "未知"
+		if report.Cache.DetectedCount > 0 {
+			hitRate = fmt.Sprintf("%.1f%%", report.Cache.HitRate)
+		}
+		fmt.Printf("  %-10d %-10d %-18s %-13s %-12s %-10s %-10.2f\n",
+			report.ConcurrentLevel, report.TotalRequests,
+			fmt.Sprintf("%d/%d", report.SuccessCount, report.FailureCount),
+			fmt.Sprintf("%.1f%%", report.SuccessRate), hitRate,
+			report.P95Latency.Round(time.Millisecond), report.RequestsPerSecond)
+	}
+	fmt.Println("  * 命中率仅用服务端明确返回 HIT/MISS 的请求计算，未知状态不纳入分母。")
 
 	if bestConcurrency == 0 {
 		bestReport = lastReport
@@ -782,6 +802,31 @@ func findMaxConcurrency(targetURL string, mode string) TestReport {
 	}
 
 	return bestReport
+}
+
+// HTTP 响应全部收齐后，再向服务端确认没有仍在执行的 systemone 请求。
+// 这避免客户端已经退出，而服务端终端日志/模型任务仍在收尾。
+func waitForServerIdle(targetURL string, timeout time.Duration) bool {
+	healthURL := strings.TrimSuffix(targetURL, "/v1/systemone") + "/health"
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := apiClient.Get(healthURL)
+		if err == nil {
+			body, readErr := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr == nil {
+				var health struct {
+					Status         string `json:"status"`
+					ActiveRequests int    `json:"active_requests"`
+				}
+				if json.Unmarshal(body, &health) == nil && health.Status == "ready" && health.ActiveRequests == 0 {
+					return true
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 // ==================== 生成报告文件 ====================
@@ -871,6 +916,9 @@ func main() {
 	targetURL := "http://127.0.0.1:8766/v1/systemone"
 	mode := flag.String("mode", modeMixed, "请求模式: repeated、unique 或 mixed")
 	flag.Parse()
+	if args := flag.Args(); len(args) > 0 {
+		*mode = args[0]
+	}
 	if *mode != modeRepeated && *mode != modeUnique && *mode != modeMixed {
 		fmt.Printf("无效的请求模式 %q，可选值: %s、%s、%s\n", *mode, modeRepeated, modeUnique, modeMixed)
 		return
@@ -883,6 +931,7 @@ func main() {
 	printKV("题库大小", fmt.Sprintf("%d 条不重复问题", len(questionBank)))
 	printKV("每并发级别请求数", "至少等于并发级别（最低 100）")
 	printKV("请求模式", *mode)
+	printKV("模式参数", "repeated | unique | mixed（也支持 -mode 参数）")
 	if *mode == modeMixed {
 		printKV("混合模式比例", "80% 重复 + 20% 唯一")
 	}
@@ -910,6 +959,11 @@ func main() {
 	// 运行并发测试
 	fmt.Println()
 	finalReport := findMaxConcurrency(targetURL, *mode)
+	if waitForServerIdle(targetURL, 30*time.Second) {
+		fmt.Println("\n  [INFO] 服务端已确认空闲，测试完整结束")
+	} else {
+		fmt.Println("\n  [WARN] 在 30 秒内未收到服务端 active_requests=0 的确认，报告仍将保存")
+	}
 
 	// 输出最终报告
 	printHeader("最终测试报告")

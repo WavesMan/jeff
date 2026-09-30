@@ -1,0 +1,515 @@
+openapi: 3.1.0
+info:
+  title: Jeff Decision API
+  version: 0.2.0
+  description: |
+    Jeff 本地决策模型 API。调用方提交状态和问题定义，服务返回每个问题的决策结果。
+    `/v1/systemone` 支持服务端结果缓存；缓存状态通过响应头和响应体返回。
+  license:
+    name: Proprietary
+servers:
+  - url: http://127.0.0.1:8766
+    description: 本地开发服务
+tags:
+  - name: System
+    description: 服务状态和模型信息
+  - name: Decision
+    description: 模型决策接口
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: 查询服务健康状态
+      operationId: getHealth
+      responses:
+        '200':
+          description: 服务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /v1/models:
+    get:
+      tags: [System]
+      summary: 获取可用模型列表
+      operationId: listModels
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 可用模型
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/systemone:
+    post:
+      tags: [Decision]
+      summary: 执行一组决策
+      description: |
+        对一个状态执行一个或多个问题判断。PyTorch 后端单次最多按 8 个问题分批推理；
+        服务端模型忙时返回 529，调用方应按 `Retry-After` 等待后重试。
+
+        当结果缓存启用时，完整校验后的请求体用于生成缓存键。缓存只保存成功的模型结果。
+      operationId: evaluateSystemOne
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluationRequest'
+            examples:
+              classification:
+                summary: 客诉路由和情绪判断
+                value:
+                  model: jeff-latest
+                  state: 客户收到的包裹已损坏，希望退款。
+                  questions:
+                    route:
+                      type: choice
+                      instructions: 应该由哪个团队处理？
+                      criteria:
+                        '1': 退款和支付
+                        '2': 包裹损坏或丢失
+                        '3': 账户和登录问题
+                    angry:
+                      type: noul
+                      instructions: 客户是否生气？
+      responses:
+        '200':
+          description: 决策完成。响应体中的 `cache_hit` 和 `model_called` 表示本次请求是否命中结果缓存及是否执行模型。
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Server-Timing:
+              $ref: '#/components/headers/ServerTiming'
+            X-Cache:
+              $ref: '#/components/headers/XCache'
+            X-Model-Called:
+              $ref: '#/components/headers/XModelCalled'
+            X-Server-Completed:
+              $ref: '#/components/headers/XServerCompleted'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionResponse'
+              examples:
+                cacheHit:
+                  summary: 缓存命中
+                  description: 完整请求结果来自服务端结果缓存，未执行模型推理。
+                  value:
+                    model: jeff-qwen3.8-27b
+                    answers:
+                      route:
+                        type: choice
+                        choice: '2'
+                        probabilities:
+                          '1': 0.03
+                          '2': 0.94
+                          '3': 0.03
+                        confidence: 0.91
+                      angry:
+                        type: noul
+                        noul: 0.87
+                    usage:
+                      input_tokens: 138
+                      output_tokens: 0
+                    cache_hit: true
+                    model_called: false
+                cacheMiss:
+                  summary: 缓存未命中
+                  description: 未找到缓存结果，本次请求执行了模型推理。
+                  value:
+                    model: jeff-qwen3.8-27b
+                    answers:
+                      route:
+                        type: choice
+                        choice: '2'
+                        probabilities:
+                          '1': 0.03
+                          '2': 0.94
+                          '3': 0.03
+                        confidence: 0.91
+                      angry:
+                        type: noul
+                        noul: 0.87
+                    usage:
+                      input_tokens: 138
+                      output_tokens: 0
+                    cache_hit: false
+                    model_called: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '529':
+          description: 模型当前忙，调用方应等待后重试。
+          headers:
+            Retry-After:
+              description: 建议等待的秒数。
+              schema:
+                type: integer
+                minimum: 0
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+        '503':
+          description: 模型尚未加载完成。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: '当环境变量 `JEFF_API_KEY` 配置后，需要提供 `Authorization: Bearer <key>`。'
+
+  headers:
+    XRequestId:
+      description: 服务端为本次 HTTP 请求生成的唯一标识。
+      schema:
+        type: string
+        example: 8f1b7c2c8f3e4cf8a5b01b4a7e4f2d10
+    ServerTiming:
+      description: 服务端请求处理耗时，单位为毫秒。
+      schema:
+        type: string
+        example: total;dur=42.7
+    XCache:
+      description: '结果缓存状态。`HIT` 表示直接返回缓存，`MISS` 表示未命中缓存并执行了模型。仅在 HTTP 200 响应中返回。'
+      schema:
+        type: string
+        enum: [HIT, MISS]
+        example: HIT
+    XModelCalled:
+      description: '是否执行了模型推理。HTTP Header 的值是字符串 `true` 或 `false`。'
+      schema:
+        type: string
+        enum: ['true', 'false']
+        example: 'false'
+    XServerCompleted:
+      description: 服务端业务处理已完成并生成响应。
+      schema:
+        type: string
+        enum: ['true']
+
+  responses:
+    Unauthorized:
+      description: API Key 缺失或无效。
+      headers:
+        WWW-Authenticate:
+          description: 认证方案。
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HTTPError'
+    ValidationError:
+      description: 请求参数校验失败。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+  schemas:
+    JSONValue:
+      description: JSON 标量、对象或数组。
+      oneOf:
+        - type: string
+        - type: number
+        - type: boolean
+        - type: 'null'
+        - type: object
+          additionalProperties: true
+        - type: array
+          items: {}
+
+    EvaluationRequest:
+      type: object
+      additionalProperties: false
+      required: [model, state, questions]
+      properties:
+        model:
+          type: string
+          description: 模型名称或别名。除 `jeff` 和 `jeff-latest` 外，也可使用当前服务加载模型的名称。
+          example: jeff-latest
+        state:
+          $ref: '#/components/schemas/JSONValue'
+        questions:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            $ref: '#/components/schemas/Question'
+        images:
+          type: array
+          maxItems: 4
+          description: Base64 Data URL 图片。支持 PNG、JPEG 和 WebP。
+          items:
+            type: string
+            pattern: '^data:image/(png|jpeg|webp);base64,'
+
+    Question:
+      oneOf:
+        - $ref: '#/components/schemas/ChoiceQuestion'
+        - $ref: '#/components/schemas/ScoreQuestion'
+        - $ref: '#/components/schemas/NoulQuestion'
+      discriminator:
+        propertyName: type
+
+    QuestionBase:
+      type: object
+      additionalProperties: false
+      properties:
+        instructions:
+          $ref: '#/components/schemas/JSONValue'
+
+    ChoiceQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type, criteria]
+          properties:
+            type:
+              const: choice
+            criteria:
+              type: object
+              minProperties: 1
+              maxProperties: 255
+              additionalProperties:
+                $ref: '#/components/schemas/JSONValue'
+
+    ScoreQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type, criteria]
+          properties:
+            type:
+              const: score
+            criteria:
+              type: array
+              minItems: 2
+              maxItems: 10
+              items:
+                $ref: '#/components/schemas/JSONValue'
+
+    NoulQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type]
+          properties:
+            type:
+              const: noul
+            criteria:
+              type: object
+              additionalProperties: false
+              properties:
+                'true':
+                  $ref: '#/components/schemas/JSONValue'
+                'false':
+                  $ref: '#/components/schemas/JSONValue'
+
+    DecisionResponse:
+      type: object
+      required: [model, answers, usage, cache_hit, model_called]
+      properties:
+        model:
+          type: string
+          description: 实际执行或生成缓存结果的模型名称。
+          example: jeff-qwen3.8-27b
+        answers:
+          type: object
+          description: 按请求中的问题标识返回对应的决策答案。
+          additionalProperties:
+            oneOf:
+              - $ref: '#/components/schemas/ChoiceAnswer'
+              - $ref: '#/components/schemas/ScoreAnswer'
+              - $ref: '#/components/schemas/NoulAnswer'
+        usage:
+          description: 本次模型输入和输出 token 数。缓存命中时为缓存结果保存的 usage 值。
+          $ref: '#/components/schemas/Usage'
+        cache_hit:
+          type: boolean
+          description: '是否直接命中服务端结果缓存。`true` 对应响应头 `X-Cache: HIT`。'
+        model_called:
+          type: boolean
+          description: '本次请求是否实际执行模型推理。`true` 对应响应头 `X-Model-Called: true`。'
+
+    ChoiceAnswer:
+      type: object
+      required: [type, choice, probabilities, confidence]
+      properties:
+        type:
+          const: choice
+          description: 答案类型。
+        choice:
+          type: string
+          description: 被选中的 criteria 键。
+        probabilities:
+          type: object
+          description: 每个 criteria 键对应的概率，所有值的总和约等于 1。
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        confidence:
+          type: number
+          description: 归一化置信度，范围为 0 到 1。
+          minimum: 0
+          maximum: 1
+
+    ScoreAnswer:
+      type: object
+      required: [type, score, legend, probabilities, confidence]
+      properties:
+        type:
+          const: score
+          description: 答案类型。
+        score:
+          type: number
+          description: 按 criteria 顺序计算的加权分数。
+        legend:
+          type: object
+          description: 分数索引或键与其说明的映射。
+          additionalProperties:
+            $ref: '#/components/schemas/JSONValue'
+        probabilities:
+          type: object
+          description: 各评分等级的概率分布。
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        confidence:
+          type: number
+          description: 归一化置信度，范围为 0 到 1。
+          minimum: 0
+          maximum: 1
+
+    NoulAnswer:
+      type: object
+      required: [type, noul]
+      properties:
+        type:
+          const: noul
+          description: 答案类型。
+        noul:
+          type: number
+          description: 是/否判断为 true 的概率，范围为 0 到 1。
+          minimum: 0
+          maximum: 1
+
+    Usage:
+      type: object
+      description: 模型 token 使用量。
+      properties:
+        input_tokens:
+          type: integer
+          description: 输入 prompt 使用的 token 数。
+          minimum: 0
+        output_tokens:
+          type: integer
+          description: 输出 token 数。本接口为单 token 决策，通常为 0。
+          minimum: 0
+
+    ModelsResponse:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [name, description, release_date]
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              release_date:
+                type: string
+                format: date
+
+    HealthResponse:
+      type: object
+      required: [status, model, checkpoint, max_options, active_requests, result_cache, authentication, modalities]
+      properties:
+        status:
+          type: string
+          enum: [ready, loading]
+        model:
+          type: string
+        checkpoint:
+          type: string
+        max_options:
+          type: integer
+          minimum: 1
+        active_requests:
+          type: integer
+          minimum: 0
+        result_cache:
+          type: object
+          required: [enabled, size, entries]
+          properties:
+            enabled:
+              type: boolean
+            size:
+              type: integer
+              minimum: 0
+            entries:
+              type: integer
+              minimum: 0
+        authentication:
+          type: boolean
+        modalities:
+          type: array
+          items:
+            type: string
+            enum: [text, image]
+
+    HTTPError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            required: [loc, msg, type]
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - type: string
+                    - type: integer
+              msg:
+                type: string
+              type:
+                type: string
