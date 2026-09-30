@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
+import hashlib
 import hmac
 import json
 import os
@@ -11,6 +13,7 @@ import threading
 import time
 import uuid
 from _thread import LockType
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -45,9 +48,46 @@ class Service:
     release_date: str = ""
     max_options: int = 0  # the most options the model was trained on; set from decision_config.json
     lock: LockType = field(default_factory=threading.Lock)
+    cache_lock: threading.RLock = field(default_factory=threading.RLock)
+    result_cache: OrderedDict[str, DecisionResponse] = field(default_factory=OrderedDict)
+    result_cache_size: int = 1024
+    active_lock: threading.Lock = field(default_factory=threading.Lock)
+    active_requests: int = 0
 
 
 service = Service()
+
+
+def request_cache_key(body: EvaluationRequest) -> str:
+    """Create a stable key from the complete validated request, including images."""
+    canonical = json.dumps(
+        body.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def cached_result(key: str) -> DecisionResponse | None:
+    if service.result_cache_size <= 0:
+        return None
+    with service.cache_lock:
+        value = service.result_cache.get(key)
+        if value is None:
+            return None
+        service.result_cache.move_to_end(key)
+        return copy.deepcopy(value)
+
+
+def store_result(key: str, value: DecisionResponse) -> None:
+    if service.result_cache_size <= 0:
+        return
+    with service.cache_lock:
+        service.result_cache[key] = copy.deepcopy(value)
+        service.result_cache.move_to_end(key)
+        while len(service.result_cache) > service.result_cache_size:
+            service.result_cache.popitem(last=False)
 
 
 class Question(BaseModel):
@@ -139,6 +179,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from jeff.model import DecisionModel
 
     service.checkpoint = os.getenv("JEFF_CHECKPOINT", "checkpoints/selected")
+    try:
+        service.result_cache_size = max(0, int(os.getenv("JEFF_RESULT_CACHE_SIZE", "1024")))
+    except ValueError as error:
+        raise ValueError("JEFF_RESULT_CACHE_SIZE must be a non-negative integer") from error
+    with service.cache_lock:
+        service.result_cache.clear()
     from jeff.models import device_from_environment, load_decision_model
 
     backend = os.getenv("JEFF_BACKEND", "pytorch")
@@ -187,8 +233,13 @@ def playground() -> str:
 
 @app.get("/health", response_model=None)
 def health() -> dict[str, JSONValue]:
+    with service.active_lock:
+        active_requests = service.active_requests
     return {"status": "ready" if service.model is not None else "loading", "model": service.name,
             "checkpoint": service.checkpoint, "max_options": service.max_options,
+            "active_requests": active_requests,
+            "result_cache": {"enabled": service.result_cache_size > 0, "size": service.result_cache_size,
+                             "entries": len(service.result_cache)},
             "authentication": bool(os.getenv("JEFF_API_KEY")),
             "modalities": ["text"] if getattr(service.model, "backend", None) == "mlx" else ["text", "image"]}
 
@@ -229,18 +280,44 @@ def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
 
 @app.post("/v1/systemone", dependencies=[Depends(authenticate)], response_model=None)
 async def system_one(body: EvaluationRequest) -> DecisionResponse:
-    model = service.model
-    if model is None:
-        raise HTTPException(503, "The model is not ready.")
-    check_option_counts(body)
-    if not service.lock.acquire(blocking=False):
-        raise HTTPException(529, "The model is busy. Retry shortly.", headers={"Retry-After": "1"})
+    with service.active_lock:
+        service.active_requests += 1
     try:
-        return await run_in_threadpool(predict, model, body)
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
+        model = service.model
+        if model is None:
+            raise HTTPException(503, "The model is not ready.")
+        check_option_counts(body)
+
+        key = request_cache_key(body)
+        cached = cached_result(key)
+        if cached is not None:
+            cached["cache_hit"] = True
+            cached["model_called"] = False
+            return JSONResponse(content=cached, headers={
+                "X-Cache": "HIT",
+                "X-Model-Called": "false",
+                "X-Server-Completed": "true",
+            })
+
+        if not service.lock.acquire(blocking=False):
+            raise HTTPException(529, "The model is busy. Retry shortly.", headers={"Retry-After": "1"})
+        try:
+            result = await run_in_threadpool(predict, model, body)
+            store_result(key, result)
+            result["cache_hit"] = False
+            result["model_called"] = True
+            return JSONResponse(content=result, headers={
+                "X-Cache": "MISS",
+                "X-Model-Called": "true",
+                "X-Server-Completed": "true",
+            })
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        finally:
+            service.lock.release()
     finally:
-        service.lock.release()
+        with service.active_lock:
+            service.active_requests -= 1
 
 
 def main() -> None:
