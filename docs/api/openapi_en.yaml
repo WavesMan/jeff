@@ -1,0 +1,519 @@
+openapi: 3.1.0
+info:
+  title: Jeff Decision API
+  version: 0.2.0
+  description: |
+    Jeff local decision model API. The caller submits a state and question definitions,
+    and the service returns a decision result for each question.
+    `/v1/systemone` supports server-side result caching; the cache status is returned in headers and the response body.
+  license:
+    name: Proprietary
+servers:
+  - url: http://127.0.0.1:8766
+    description: Local development service
+tags:
+  - name: System
+    description: Service status and model information
+  - name: Decision
+    description: Model decision endpoints
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Get service health status
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /v1/models:
+    get:
+      tags: [System]
+      summary: List available models
+      operationId: listModels
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Available models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/systemone:
+    post:
+      tags: [Decision]
+      summary: Execute a set of decisions
+      description: |
+        Evaluates one or more questions against a state. The PyTorch backend processes at most 8 questions per batch.
+        When the model is busy, the service returns 529; callers should wait according to `Retry-After` and retry.
+
+        When result caching is enabled, the complete validated request body is used to generate the cache key.
+        Only successful model results are cached.
+      operationId: evaluateSystemOne
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluationRequest'
+            examples:
+              classification:
+                summary: Complaint routing and sentiment classification
+                value:
+                  model: jeff-latest
+                  state: The customer received a damaged parcel and wants a refund.
+                  questions:
+                    route:
+                      type: choice
+                      instructions: Which team should handle this?
+                      criteria:
+                        '1': Refunds and payments
+                        '2': Damaged or lost parcels
+                        '3': Account and login problems
+                    angry:
+                      type: noul
+                      instructions: Is the customer angry?
+      responses:
+        '200':
+          description: |
+            Decision completed. The `cache_hit` and `model_called` fields indicate whether the result came from
+            the result cache and whether model inference was executed.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Server-Timing:
+              $ref: '#/components/headers/ServerTiming'
+            X-Cache:
+              $ref: '#/components/headers/XCache'
+            X-Model-Called:
+              $ref: '#/components/headers/XModelCalled'
+            X-Server-Completed:
+              $ref: '#/components/headers/XServerCompleted'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionResponse'
+              examples:
+                cacheHit:
+                  summary: Cache hit
+                  description: The complete result was returned from the server-side result cache; model inference was not executed.
+                  value:
+                    model: jeff-qwen3.8-27b
+                    answers:
+                      route:
+                        type: choice
+                        choice: '2'
+                        probabilities:
+                          '1': 0.03
+                          '2': 0.94
+                          '3': 0.03
+                        confidence: 0.91
+                      angry:
+                        type: noul
+                        noul: 0.87
+                    usage:
+                      input_tokens: 138
+                      output_tokens: 0
+                    cache_hit: true
+                    model_called: false
+                cacheMiss:
+                  summary: Cache miss
+                  description: No cached result was found; model inference was executed for this request.
+                  value:
+                    model: jeff-qwen3.8-27b
+                    answers:
+                      route:
+                        type: choice
+                        choice: '2'
+                        probabilities:
+                          '1': 0.03
+                          '2': 0.94
+                          '3': 0.03
+                        confidence: 0.91
+                      angry:
+                        type: noul
+                        noul: 0.87
+                    usage:
+                      input_tokens: 138
+                      output_tokens: 0
+                    cache_hit: false
+                    model_called: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '529':
+          description: The model is busy; the caller should wait and retry.
+          headers:
+            Retry-After:
+              description: Recommended wait time in seconds.
+              schema:
+                type: integer
+                minimum: 0
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+        '503':
+          description: The model has not finished loading.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'When `JEFF_API_KEY` is configured, provide `Authorization: Bearer <key>`.'
+
+  headers:
+    XRequestId:
+      description: Unique identifier generated by the service for this HTTP request.
+      schema:
+        type: string
+        example: 8f1b7c2c8f3e4cf8a5b01b4a7e4f2d10
+    ServerTiming:
+      description: Server-side request processing time in milliseconds.
+      schema:
+        type: string
+        example: total;dur=42.7
+    XCache:
+      description: 'Result cache status. `HIT` means the result was returned directly from cache; `MISS` means the model was executed. Returned only for HTTP 200 responses.'
+      schema:
+        type: string
+        enum: [HIT, MISS]
+        example: HIT
+    XModelCalled:
+      description: 'Whether model inference was executed. The HTTP header value is the string `true` or `false`.'
+      schema:
+        type: string
+        enum: ['true', 'false']
+        example: 'false'
+    XServerCompleted:
+      description: Server-side business processing has completed and the response has been generated.
+      schema:
+        type: string
+        enum: ['true']
+
+  responses:
+    Unauthorized:
+      description: API key is missing or invalid.
+      headers:
+        WWW-Authenticate:
+          description: Authentication scheme.
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HTTPError'
+    ValidationError:
+      description: Request parameter validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+  schemas:
+    JSONValue:
+      description: A JSON scalar, object, or array.
+      oneOf:
+        - type: string
+        - type: number
+        - type: boolean
+        - type: 'null'
+        - type: object
+          additionalProperties: true
+        - type: array
+          items: {}
+
+    EvaluationRequest:
+      type: object
+      additionalProperties: false
+      required: [model, state, questions]
+      properties:
+        model:
+          type: string
+          description: Model name or alias. Besides `jeff` and `jeff-latest`, the name of the model currently loaded by the service may be used.
+          example: jeff-latest
+        state:
+          $ref: '#/components/schemas/JSONValue'
+        questions:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            $ref: '#/components/schemas/Question'
+        images:
+          type: array
+          maxItems: 4
+          description: Base64 Data URL images. PNG, JPEG, and WebP are supported.
+          items:
+            type: string
+            pattern: '^data:image/(png|jpeg|webp);base64,'
+
+    Question:
+      oneOf:
+        - $ref: '#/components/schemas/ChoiceQuestion'
+        - $ref: '#/components/schemas/ScoreQuestion'
+        - $ref: '#/components/schemas/NoulQuestion'
+      discriminator:
+        propertyName: type
+
+    QuestionBase:
+      type: object
+      additionalProperties: false
+      properties:
+        instructions:
+          $ref: '#/components/schemas/JSONValue'
+
+    ChoiceQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type, criteria]
+          properties:
+            type:
+              const: choice
+            criteria:
+              type: object
+              minProperties: 1
+              maxProperties: 255
+              additionalProperties:
+                $ref: '#/components/schemas/JSONValue'
+
+    ScoreQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type, criteria]
+          properties:
+            type:
+              const: score
+            criteria:
+              type: array
+              minItems: 2
+              maxItems: 10
+              items:
+                $ref: '#/components/schemas/JSONValue'
+
+    NoulQuestion:
+      allOf:
+        - $ref: '#/components/schemas/QuestionBase'
+        - type: object
+          required: [type]
+          properties:
+            type:
+              const: noul
+            criteria:
+              type: object
+              additionalProperties: false
+              properties:
+                'true':
+                  $ref: '#/components/schemas/JSONValue'
+                'false':
+                  $ref: '#/components/schemas/JSONValue'
+
+    DecisionResponse:
+      type: object
+      required: [model, answers, usage, cache_hit, model_called]
+      properties:
+        model:
+          type: string
+          description: Name of the model that executed the request or produced the cached result.
+          example: jeff-qwen3.8-27b
+        answers:
+          type: object
+          description: Decision answer keyed by the question identifiers from the request.
+          additionalProperties:
+            oneOf:
+              - $ref: '#/components/schemas/ChoiceAnswer'
+              - $ref: '#/components/schemas/ScoreAnswer'
+              - $ref: '#/components/schemas/NoulAnswer'
+        usage:
+          description: Model input and output token counts. On a cache hit, these values are retained from the cached result.
+          $ref: '#/components/schemas/Usage'
+        cache_hit:
+          type: boolean
+          description: 'Whether the server-side result cache was used. `true` corresponds to `X-Cache: HIT`.'
+        model_called:
+          type: boolean
+          description: 'Whether model inference was executed for this request. `true` corresponds to `X-Model-Called: true`.'
+
+    ChoiceAnswer:
+      type: object
+      required: [type, choice, probabilities, confidence]
+      properties:
+        type:
+          const: choice
+          description: Answer type.
+        choice:
+          type: string
+          description: Selected criteria key.
+        probabilities:
+          type: object
+          description: Probability for each criteria key; values sum to approximately 1.
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        confidence:
+          type: number
+          description: Normalized confidence from 0 to 1.
+          minimum: 0
+          maximum: 1
+
+    ScoreAnswer:
+      type: object
+      required: [type, score, legend, probabilities, confidence]
+      properties:
+        type:
+          const: score
+          description: Answer type.
+        score:
+          type: number
+          description: Weighted score calculated in criteria order.
+        legend:
+          type: object
+          description: Mapping from score index or key to its description.
+          additionalProperties:
+            $ref: '#/components/schemas/JSONValue'
+        probabilities:
+          type: object
+          description: Probability distribution across score levels.
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        confidence:
+          type: number
+          description: Normalized confidence from 0 to 1.
+          minimum: 0
+          maximum: 1
+
+    NoulAnswer:
+      type: object
+      required: [type, noul]
+      properties:
+        type:
+          const: noul
+          description: Answer type.
+        noul:
+          type: number
+          description: Probability that the yes/no decision is true, from 0 to 1.
+          minimum: 0
+          maximum: 1
+
+    Usage:
+      type: object
+      description: Model token usage.
+      properties:
+        input_tokens:
+          type: integer
+          description: Number of tokens used by the input prompt.
+          minimum: 0
+        output_tokens:
+          type: integer
+          description: Number of output tokens. This API makes a single-token decision and usually returns 0.
+          minimum: 0
+
+    ModelsResponse:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [name, description, release_date]
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              release_date:
+                type: string
+                format: date
+
+    HealthResponse:
+      type: object
+      required: [status, model, checkpoint, max_options, active_requests, result_cache, authentication, modalities]
+      properties:
+        status:
+          type: string
+          enum: [ready, loading]
+        model:
+          type: string
+        checkpoint:
+          type: string
+        max_options:
+          type: integer
+          minimum: 1
+        active_requests:
+          type: integer
+          minimum: 0
+        result_cache:
+          type: object
+          required: [enabled, size, entries]
+          properties:
+            enabled:
+              type: boolean
+            size:
+              type: integer
+              minimum: 0
+            entries:
+              type: integer
+              minimum: 0
+        authentication:
+          type: boolean
+        modalities:
+          type: array
+          items:
+            type: string
+            enum: [text, image]
+
+    HTTPError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            required: [loc, msg, type]
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - type: string
+                    - type: integer
+              msg:
+                type: string
+              type:
+                type: string
